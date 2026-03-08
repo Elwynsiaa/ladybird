@@ -29,14 +29,21 @@ jobs:
         run: |
           py Meta\ladybird.py build
 
-      # Add this new step! It gathers all required files into a folder named "ladybird-install"
       - name: Install Ladybird
         run: |
           cmake --install Build\release --prefix ladybird-install
+
+      - name: Copy third-party Dependency DLLs
+        # This copies all the vcpkg DLLs (Qt6, pthreads, etc.) and Qt plugins (like qwindows.dll)
+        # GitHub Actions windows-latest uses PowerShell by default for 'run' commands
+        run: |
+          Copy-Item "Build\release\vcpkg_installed\x64-windows\bin\*.dll" -Destination "ladybird-install\bin" -Force
+          
+          # Qt applications also require the "platforms" folder to open a window
+          Copy-Item "Build\release\vcpkg_installed\x64-windows\plugins\*" -Destination "ladybird-install\bin" -Recurse -Force
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Ladybird-Windows-Build
-          # Point the uploader to the new install folder containing everything
           path: ladybird-install\
