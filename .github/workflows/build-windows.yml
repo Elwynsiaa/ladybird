@@ -1,49 +1,124 @@
-name: Build Ladybird for Windows (.exe)
+name: Build win32 (.exe)
 
-on: [push, pull_request]
+on:
+  workflow_dispatch: # This allows you to trigger the build manually
+
+env:
+  LADYBIRD_SOURCE_DIR: ${{ github.workspace }}
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  VCPKG_ROOT: ${{ github.workspace }}/Build/vcpkg
+  CCACHE_COMPILERCHECK: "%compiler% -v"
 
 jobs:
   build-windows:
+    name: Windows Release Build
     runs-on: windows-latest
-    
+    defaults:
+      run:
+        shell: pwsh
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Python
-        uses: actions/setup-python@v5
+      - name: Set Up Environment
+        uses: ./.github/actions/setup
         with:
-          python-version: '3.12'
+          os: 'Windows'
+          arch: 'x86_64'
+          toolchain: 'ClangCL'
 
-      - name: Install Dependencies via Chocolatey
-        # The instructions specify installing pkgconfiglite via choco.
-        # GitHub's windows-latest runner comes with Chocolatey pre-installed.
+      - name: Restore Caches
+        uses: ./.github/actions/cache-restore
+        id: 'cache-restore'
+        with:
+          runner_labels: '["windows-latest"]'
+          os: 'Windows'
+          arch: 'x86_64'
+          toolchain: 'ClangCL'
+          cache_key_extra: 'Windows_CI'
+          ccache_path: ${{ env.CCACHE_DIR }}
+          download_cache_path: ${{ github.workspace }}/Build/caches
+          vcpkg_cache_path: ${{ github.workspace }}/Build/caches/vcpkg-binary-cache
+
+      - name: Configure CMake
+        working-directory: ${{ github.workspace }}
+        env:
+          VCPKG_CACHE_SAS: ${{ github.ref == 'refs/heads/master' && secrets.VCPKG_CACHE_SAS || '' }}
+          VCPKG_CACHE_MODE: ${{ github.ref == 'refs/heads/master' && 'write' || '' }}
         run: |
-          choco install pkgconfiglite -y
+          cmake --preset Windows_CI -B Build `
+            -DENABLE_CI_BASELINE_CPU=ON `
+            -DENABLE_TESTS=OFF `
+            -DBUILD_TESTING=OFF `
+            -DENABLE_LAGOM_TESTS=OFF
+
+      - name: Build
+        working-directory: ${{ github.workspace }}/Build
+        run: |
+          cmake --build .
+          cmake --install . --strip --prefix ${{ github.workspace }}/Install
+
+      - name: Bundle DLLs
+        run: |
+          $installDir = "${{ github.workspace }}/Install"
+          $binDir = "$installDir/bin"
+          $buildDir = "${{ github.workspace }}/Build"
+
+          if (!(Test-Path $binDir)) { New-Item -ItemType Directory -Path $binDir }
+
+          # Copy VCPKG DLLs
+          Write-Host "Copying dependencies..."
+          Copy-Item "$buildDir/vcpkg_installed/x64-windows/bin/*.dll" -Destination $binDir -Force -ErrorAction SilentlyContinue
+
+          # Find and copy Qt Platform Plugin
+          Write-Host "Searching for qwindows.dll..."
+          $qwindowsFile = Get-ChildItem -Path "$buildDir/vcpkg_installed" -Recurse -Filter "qwindows.dll" | Select-Object -First 1
           
-      - name: Set up Visual Studio Command Prompt
-        # This action sets up the environment variables to use the VS MSVC / Clang-CL compiler
-        uses: ilammy/msvc-dev-cmd@v1
+          if ($qwindowsFile) {
+             $destPlatforms = "$binDir/platforms"
+             New-Item -ItemType Directory -Force -Path $destPlatforms
+             Write-Host "Found qwindows at $($qwindowsFile.FullName)"
+             Copy-Item $qwindowsFile.FullName -Destination $destPlatforms -Force
+          } else {
+             Write-Error "Could not find qwindows.dll in build directory!"
+          }
 
-      - name: Build Ladybird
-        run: |
-          py Meta\ladybird.py build
-
-      - name: Install Ladybird
-        run: |
-          cmake --install Build\release --prefix ladybird-install
-
-      - name: Copy third-party Dependency DLLs
-        # This copies all the vcpkg DLLs (Qt6, pthreads, etc.) and Qt plugins (like qwindows.dll)
-        # GitHub Actions windows-latest uses PowerShell by default for 'run' commands
-        run: |
-          Copy-Item "Build\release\vcpkg_installed\x64-windows\bin\*.dll" -Destination "ladybird-install\bin" -Force
+          # Find and copy Qt Image Formats
+          Write-Host "Searching for Qt Image Formats..."
+          $qjpegFile = Get-ChildItem -Path "$buildDir/vcpkg_installed" -Recurse -Filter "qjpeg.dll" | Select-Object -First 1
           
-          # Qt applications also require the "platforms" folder to open a window
-          Copy-Item "Build\release\vcpkg_installed\x64-windows\Qt6\plugins\*" -Destination "ladybird-install\bin" -Recurse -Force
+          if ($qjpegFile) {
+             $sourceImgDir = $qjpegFile.DirectoryName
+             $destImgFormats = "$binDir/imageformats"
+             New-Item -ItemType Directory -Force -Path $destImgFormats
+             Write-Host "Found imageformats at $sourceImgDir"
+             Copy-Item "$sourceImgDir/*.dll" -Destination $destImgFormats -Force
+          }
 
-      - name: Upload Artifact
+          # Flatten libexec
+          if (Test-Path "$installDir/libexec") {
+              Write-Host "Moving helper executables..."
+              Copy-Item "$installDir/libexec/*.exe" -Destination $binDir -Force
+              Remove-Item "$installDir/libexec" -Recurse -Force
+          }
+          
+          # Cleanup Development Files
+          Write-Host "Removing development headers and libs..."
+          Remove-Item -Path "$installDir/include" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "$installDir/lib" -Recurse -Force -ErrorAction SilentlyContinue
+
+      - name: Upload Windows Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Ladybird-Windows-Build
-          path: ladybird-install\
+          name: Ladybird-Windows-Release
+          path: ${{ github.workspace }}/Install
+
+      - name: Save Caches
+        uses: ./.github/actions/cache-save
+        with:
+          runner_labels: '["windows-latest"]'
+          arch: 'x86_64'
+          ccache_path: ${{ env.CCACHE_DIR }}
+          ccache_primary_key: ${{ steps.cache-restore.outputs.ccache_primary_key }}
+          vcpkg_cache_path: ${{ github.workspace }}/Build/caches/vcpkg-binary-cache
+          vcpkg_cache_primary_key: ${{ steps.cache-restore.outputs.vcpkg_cache_primary_key }}
